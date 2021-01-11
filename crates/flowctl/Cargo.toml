@@ -3,6 +3,7 @@ name = "flowctl"
 version = "0.0.0"
 authors = ["Estuary Technologies, Inc"]
 edition = "2018"
+build = "../../shared-build.rs"
 
 [dependencies]
 catalog = { path = "../catalog", version = "0.0.0" }
