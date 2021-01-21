@@ -94,6 +94,11 @@ static TYPE_ATTRS: &'static [TypeAttrs<'static>] = &[
             ("max_length", OPTIONAL_U32_ATTR),
         ],
     },
+    TypeAttrs {
+        path: "flow.Slice",
+        type_attrs: "#[derive(Copy)]",
+        field_attrs: &[],
+    },
 ];
 
 fn main() {
