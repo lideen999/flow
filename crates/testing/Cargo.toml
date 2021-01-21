@@ -16,10 +16,10 @@ futures = "*"
 itertools = "*"
 log = "*"
 percent-encoding = "*"
-prost = "*"
+prost = "0.7"
 rusqlite = { version = "*", features = ["bundled", "collation", "column_decltype", "functions", "serde_json", "url"] }
 serde = { version = "*", features = ["derive"] }
 serde_json = { version =  "*"}
 thiserror = "*"
-tonic = { version = "*" }
+tonic = { version = "0.4" }
 url = "*"

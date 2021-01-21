@@ -156,9 +156,8 @@ struct Txn {
 
 impl<'e> APIInner<'e> {
     fn build_runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new()
-            .threaded_scheduler()
-            .core_threads(1)
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .thread_name("derive-service-worker")
             .enable_all()
             .build()
@@ -182,7 +181,7 @@ impl<'e> APIInner<'e> {
         let ctx =
             super::context::Context::build_from_catalog(&db, &derivation, schema_index, &node)?;
 
-        let mut api = Self::from_parts(
+        let api = Self::from_parts(
             Self::build_runtime(),
             schema_index,
             ctx,
