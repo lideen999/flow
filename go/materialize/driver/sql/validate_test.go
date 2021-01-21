@@ -1,4 +1,4 @@
-package driver
+package sql
 
 import (
 	"fmt"
@@ -19,7 +19,7 @@ func TestValidations(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tempdir)
 
-	cat, err := flow.NewCatalog("../../../catalog.db", tempdir)
+	cat, err := flow.NewCatalog("../../../../catalog.db", tempdir)
 	require.NoError(t, err)
 
 	var collections = []string{
