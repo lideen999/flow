@@ -17,7 +17,7 @@ runtime = { path = "../runtime", version = "0.0.0" }
 
 async-trait = "*"
 anyhow = "*"
-tonic = "0.4"
+tonic = "*"
 tracing = "*"
 tracing-subscriber = "*"
 tracing-futures = "*"
@@ -30,8 +30,8 @@ schemars = "*"
 serde_json = { version =  "*"}
 structopt = "*"
 tempfile = "*"
-tokio = { version = "1.0", features = ["full"] }
-tokio-stream = "0.1"
+tokio = { version = "*", features = ["full"] }
+tokio-stream = "*"
 url = "*"
 rand = "*"
 rand_chacha = "*"
