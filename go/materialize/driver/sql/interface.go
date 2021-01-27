@@ -22,30 +22,43 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// Transaction represents a database transaction, which will correspond one-to-one with a
-// transaction rpc.
-type Transaction interface {
-	// AddLoadKey adds the given key to the query.
-	AddLoadKey(ctx context.Context, key []interface{}) error
-	// PollLoadResults is called after adding the load keys for each LoadRequest, and
-	// may return result documents by adding them to the given arena and returning a Slice for each
-	// document. Nothing should be returned for a document that does not exist.
-	PollLoadResults(ctx context.Context, arena *pf.Arena) ([]pf.Slice, error)
+type Transaction struct {
+	// LoadKeyCh is a channel into which keys to load are written.
+	// It's closed when all load keys have been sent, and at that time
+	// the Transaction must begin sending loaded documents if it hasn't already.
+	LoadKeyCh chan<- tuple.Tuple
 
-	// FlushLoadResults is called after each LoadEOF message, as this is the last opportunity to
-	// return any documents that were loaded.
-	FlushLoadResults(ctx context.Context, arena *pf.Arena) ([]pf.Slice, error)
+	// LoadedDocumentCh is a channel into which the transaction implementation
+	// sends loaded documents, either as they're processed from LoadKeyCh,
+	// or all at once upon reading a LoadKeyCh close. Once all loaded documents
+	// have been sent, the channel is closed to indicate so to the driver.
+	// A non-nil Error is to be considered terminal and aborts the Transaction.
+	LoadedDocumentCh <-chan LoadedDocument
 
-	// Insert is called for each row in each StoreRequest message where `exists` is `false`
-	Insert(ctx context.Context, args []interface{}) error
+	// StoreDocumentCh is a channel into which StoreDocuments are written
+	// by the driver. The implementation is expected to begin processing StoreDocuments
+	// only after a successful close of LoadedDocumentCh.
+	// The channel is closed by the driver once all StoreDocuments have been sent,
+	// indicating the Transaction should commit.
+	StoreDocumentCh chan<- StoreDocument
 
-	// Update is called for each row in each StoreRequest message where `exists` is `true`
-	Update(ctx context.Context, args []interface{}) error
+	// CommitCh is a channel into which a single, final commit status error is sent.
+	// The implementation is expected to send a final nil or error after StoreDocumentCh
+	// has closed and the Transaction has fully committed, or failed to commit.
+	CommitCh <-chan error
+}
 
-	// Commit is called at the very end to a transaction, as long as no errors have been returned.
-	Commit(ctx context.Context) error
-	// Rollback is called if an error occurs as any point during an open transaction.
-	Rollback() error
+type LoadedDocument struct {
+	Error    error
+	Document json.RawMessage
+	// .. can be extended with key & value fields, etc in the future.
+}
+
+type StoreDocument struct {
+	Update   bool
+	Key      tuple.Tuple
+	Values   tuple.Tuple
+	Document json.RawMessage
 }
 
 // Connection represents a pool of database connections for a specific URI.
@@ -201,11 +214,186 @@ func (g *GenericDriver) Fence(ctx context.Context, req *pm.FenceRequest) (*pm.Fe
 	}, nil
 }
 
+func handleTxnRecvStream(logEntry *log.Entry, ctx context.Context, stream pm.Driver_TransactionServer, transaction Transaction, errorCh chan<- error) {
+	var err = handleTxnRecvFailable(logEntry, ctx, stream, transaction)
+	if err != nil {
+		errorCh <- err
+	}
+	close(errorCh)
+}
+
+func handleTxnRecvFailable(logEntry *log.Entry, ctx context.Context, stream pm.Driver_TransactionServer, transaction Transaction) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			logEntry.WithField("error", retErr).Warnf("txRecv failed with err")
+			if transaction.LoadKeyCh != nil {
+				close(transaction.LoadKeyCh)
+				transaction.LoadKeyCh = nil
+			}
+			if transaction.StoreDocumentCh != nil {
+				close(transaction.StoreDocumentCh)
+				transaction.StoreDocumentCh = nil
+			}
+		}
+	}()
+	var nLoadReqs, nDocs int
+	for {
+		var req, err = stream.Recv()
+		if err != nil {
+			return fmt.Errorf("failed to receive next load message: %w", err)
+		}
+		if req.Load != nil {
+			nLoadReqs++
+			nDocs += len(req.Load.PackedKeys)
+			logEntry.WithField("numDocs", len(req.Load.PackedKeys)).Trace("got load request")
+			for _, key := range req.Load.PackedKeys {
+				tup, err := tuple.Unpack(req.Load.Arena.Bytes(key))
+				if err != nil {
+					return err
+				}
+				select {
+				case transaction.LoadKeyCh <- tup:
+					// we sent the key
+				case <-ctx.Done():
+					// Something else has failed, so we should return
+					return ContextCancelled
+				}
+				transaction.LoadKeyCh <- tup
+			}
+		} else if req.LoadEOF != nil {
+			break
+		} else {
+			return fmt.Errorf("expected either a Load or LoadEOF message")
+		}
+	}
+	close(transaction.LoadKeyCh)
+	transaction.LoadKeyCh = nil
+	logEntry.WithFields(log.Fields{
+		"totalLoadDocs": nDocs,
+		"loadRequests":  nLoadReqs,
+	}).Debug("Finished receiving LoadRequests")
+
+	var nStoreReqs, nStoreDocs int
+	for {
+		var req, err = stream.Recv()
+		if err == io.EOF {
+			err = nil
+			break
+		} else if err != nil {
+			return fmt.Errorf("failed to receive next store message: %w", err)
+		}
+		if req.Store == nil {
+			return fmt.Errorf("expected Store message")
+		}
+		nStoreReqs++
+		nStoreDocs += len(req.Store.DocsJson)
+		for i, docSlice := range req.Store.DocsJson {
+			key, err := tuple.Unpack(req.Store.Arena.Bytes(req.Store.PackedKeys[i]))
+			if err != nil {
+				return err
+			}
+			values, err := tuple.Unpack(req.Store.Arena.Bytes(req.Store.PackedValues[i]))
+			if err != nil {
+				return err
+			}
+			var docJson = req.Store.Arena.Bytes(docSlice)
+			var exists = req.Store.Exists[i]
+
+			var store = StoreDocument{
+				Update:   exists,
+				Key:      key,
+				Values:   values,
+				Document: docJson,
+			}
+			transaction.StoreDocumentCh <- store
+		}
+	}
+	close(transaction.StoreDocumentCh)
+	transaction.StoreDocumentCh = nil
+	logEntry.WithFields(log.Fields{
+		"storeRequests":  nStoreReqs,
+		"totalStoreDocs": nStoreDocs,
+	}).Debug("Finished receiving StoreRequests")
+	return nil
+}
+
+// LoadResponseArenaSize is the target size we'll try to hit for response arenas. The actual arena
+// response sizes may be larger.
+const LoadResponseArenaSize = 16 * 1024
+
+func handleTxnSend(logEntry *log.Entry, ctx context.Context, stream pm.Driver_TransactionServer, transaction Transaction, errCh chan<- error) {
+	var err = handleTxnSendFailable(logEntry, stream, transaction)
+	errCh <- err
+}
+
+func handleTxnSendFailable(logEntry *log.Entry, stream pm.Driver_TransactionServer, transaction Transaction) error {
+	// We'll re-use the same arena for all responses, just to avoid re-allocating in a tight loop.
+	var loadArena = pf.Arena(make([]byte, 0, LoadResponseArenaSize))
+	var slices = make([]pf.Slice, 0, 16)
+	var nDocs = 0
+
+	var doSend = func() error {
+		logEntry.WithFields(log.Fields{
+			"numDocs": nDocs,
+		}).Debug("Sending LoadResponse")
+		var resp = &pm.TransactionResponse{
+			LoadResponse: &pm.TransactionResponse_LoadResponse{
+				Arena:    loadArena,
+				DocsJson: slices,
+			},
+		}
+		var err = stream.Send(resp)
+		// clear these for re-use
+		loadArena = loadArena[:0]
+		slices = slices[:0]
+		return err
+	}
+
+	for loaded := range transaction.LoadedDocumentCh {
+		if loaded.Error != nil {
+			return loaded.Error
+		}
+		if nDocs > 0 && len(loaded.Document)+len(loadArena) >= LoadResponseArenaSize {
+			var err = doSend()
+			if err != nil {
+				return fmt.Errorf("failed to send LoadResponse")
+			}
+		}
+		nDocs++
+		slices = append(slices, loadArena.Add(loaded.Document))
+	}
+	// We may need to send the final LoadResponse here, since the arena may now be partially full.
+	if len(slices) > 0 {
+		var err = doSend()
+		if err != nil {
+			return fmt.Errorf("failed to send LoadResponse")
+		}
+	}
+
+	var err = stream.Send(&pm.TransactionResponse{
+		LoadEOF: &pm.LoadEOF{},
+	})
+	if err != nil {
+		return err
+	}
+	logEntry.Debug("Finished sending LoadResponses")
+
+	// Wait until we've committed, then send the response.
+	err = <-transaction.CommitCh
+	if err != nil {
+		logEntry.WithField("error", err).Warn("Transaction Commit Failed")
+		return err
+	}
+	logEntry.Debug("Transaction Commit Success")
+	return stream.Send(&pm.TransactionResponse{
+		StoreResponse: &pm.TransactionResponse_StoreResponse{},
+	})
+}
+
 // Transaction is part of the DriverServer implementation
 func (g *GenericDriver) Transaction(stream pm.Driver_TransactionServer) (retErr error) {
-	log.Debug("on Transaction start")
-	var committed = false
 	var ctx = stream.Context()
+	log.Debug("on Transaction start")
 	req, err := stream.Recv()
 	log.Debug("Received first message")
 	if err != nil {
@@ -242,174 +430,16 @@ func (g *GenericDriver) Transaction(stream pm.Driver_TransactionServer) (retErr 
 		return err
 	}
 
-	defer func() {
-		if retErr != nil && !committed {
-			var rbErr = transaction.Rollback()
-			logEntry.WithField("error", retErr).Warnf("Rolled back failed transaction with result: %v", rbErr)
-		} else if retErr != nil {
-			// If committed is true, then the error must have been returned from the call to commit
-			logEntry.WithField("error", retErr).Warnf("Failed to commit Store transaction")
-		} else {
-			logEntry.Debug("Successfully committed Store transaction")
-		}
-	}()
+	var sendCompleteCh = make(chan error)
+	go handleTxnSend(logEntry, ctx, stream, transaction, sendCompleteCh)
 
-	var loadResponseNum = 0
-	// Handle all the Loads
-	var responseArena pf.Arena
-	for {
-		req, err = stream.Recv()
-		if err != nil {
-			return err // EOF is not expected here, so we'd return is as an error.
-		}
-
-		if req.Load != nil {
-			logEntry.WithField("numDocs", len(req.Load.PackedKeys)).Trace("got load request")
-			for _, key := range req.Load.PackedKeys {
-				tup, err := tuple.Unpack(req.Load.Arena.Bytes(key))
-				if err != nil {
-					return err
-				}
-				args, err := cachedSQL.QueryKeyConverter.Convert(tup.ToInterface()...)
-				if err != nil {
-					return err
-				}
-				err = transaction.AddLoadKey(ctx, args)
-				if err != nil {
-					return err
-				}
-			}
-
-			// Poll to see whether we'll send a LoadResponse now
-			slices, err := transaction.PollLoadResults(ctx, &responseArena)
-			if err != nil {
-				return fmt.Errorf("failed to poll load results: %w", err)
-			}
-			if len(slices) > 0 {
-				loadResponseNum++
-				logEntry.Trace("sending load response: ", loadResponseNum)
-				var response = pm.TransactionResponse_LoadResponse{
-					Arena:    responseArena,
-					DocsJson: slices,
-				}
-				err = stream.Send(&pm.TransactionResponse{
-					LoadResponse: &response,
-				})
-				if err != nil {
-					return fmt.Errorf("failed to send load repsonse")
-				}
-				// Since we sent a response, truncate the response arena for later re-use.
-				responseArena = responseArena[:0]
-			}
-		} else {
-			// If Load == nil, then the next message must be a LoadEOF
-			if req.LoadEOF == nil {
-				return fmt.Errorf("expected either a Load or LoadEOF message")
-			}
-			// We're done loading, so it's time to flush the Loading stage of the transaction. This
-			// will be the final LoadResponse for this transaction, and it might also be the only
-			// one.
-			slices, err := transaction.FlushLoadResults(ctx, &responseArena)
-			if err != nil {
-				return fmt.Errorf("failed to flush load results: %w", err)
-			}
-			if len(slices) > 0 {
-				loadResponseNum++
-				logEntry.Trace("sending final load response: ", loadResponseNum)
-				var response = pm.TransactionResponse_LoadResponse{
-					Arena:    responseArena,
-					DocsJson: slices,
-				}
-				err = stream.Send(&pm.TransactionResponse{
-					LoadResponse: &response,
-				})
-				if err != nil {
-					return fmt.Errorf("failed to send load repsonse")
-				}
-			}
-
-			// We're done sending LoadResponses, so now we send the LoadEOF
-			err = stream.Send(&pm.TransactionResponse{
-				LoadEOF: &pm.LoadEOF{},
-			})
-			if err != nil {
-				return fmt.Errorf("failed to send loadEOF")
-			}
-			break
-		}
-	}
-
-	// Time to handle some Stores!
-	for {
-		req, err := stream.Recv()
-		if err == io.EOF {
-			err = nil // So we don't treat this as an error condition
-			break
-		} else if err != nil {
-			return err
-		}
-		if req.Store == nil {
-			return fmt.Errorf("expected Store message")
-		}
-
-		for i, docSlice := range req.Store.DocsJson {
-			key, err := tuple.Unpack(req.Store.Arena.Bytes(req.Store.PackedKeys[i]))
-			if err != nil {
-				return err
-			}
-			values, err := tuple.Unpack(req.Store.Arena.Bytes(req.Store.PackedValues[i]))
-			if err != nil {
-				return err
-			}
-			var docJson = req.Store.Arena.Bytes(docSlice)
-			var exists = req.Store.Exists[i]
-			var args []interface{}
-			// Are we doing an update or an insert?
-			// Note that the order of arguments is different for inserts vs updates.
-			if exists {
-				args = append(args, values.ToInterface()...)
-				args = append(args, docJson)
-				args = append(args, key.ToInterface()...)
-
-				convertedValues, err := cachedSQL.UpdateValuesConverter.Convert(args...)
-				if err != nil {
-					return err
-				}
-				err = transaction.Update(ctx, convertedValues)
-				if err != nil {
-					return err
-				}
-			} else {
-				args = append(args, key.ToInterface()...)
-				args = append(args, values.ToInterface()...)
-				args = append(args, docJson)
-
-				convertedValues, err := cachedSQL.InsertValuesConverter.Convert(args...)
-				if err != nil {
-					return err
-				}
-				err = transaction.Insert(ctx, convertedValues)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	logEntry.Debug("Committing transaction")
-	// At this point, we've gotten an EOF, so we're done processing Store requests.
-	// It's time to commit the transaction and send a Store response.
-	err = transaction.Commit(ctx)
-	committed = true
+	err = handleTxnRecvFailable(logEntry, ctx, stream, transaction)
 	if err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return err
 	}
-
-	err = stream.Send(&pm.TransactionResponse{
-		StoreResponse: &pm.TransactionResponse_StoreResponse{},
-	})
+	err = <-sendCompleteCh
 	if err != nil {
-		return fmt.Errorf("failed to send StoreResponse after transaction commit: %w", err)
+		return err
 	}
 	return nil
 }
