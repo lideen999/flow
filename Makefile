@@ -287,7 +287,7 @@ test-pg-driver: ${RUSTBIN}/libbindings.a crates/bindings/flow_bindings.h
 
 .PHONY: catalog-test
 catalog-test: ${GOBIN}/flowctl ${TOOLBIN}/etcd
-	${GOBIN}/flowctl test --source ${ROOTDIR}/examples/flow.yaml
+	${GOBIN}/flowctl check --source ${ROOTDIR}/examples/flow.yaml
 
 .PHONY: package
 package: $(PACKAGE_TARGETS)

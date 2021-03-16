@@ -21,9 +21,9 @@ func main() {
 Build a Flow catalog into a build directory and catalog database.
 `, &cmdBuild{})
 
-	_, _ = parser.AddCommand("test", "Test a Flow catalog", `
+	_, _ = parser.AddCommand("check", "Check a Flow catalog", `
 Build and test a Flow catalog.
-`, &cmdTest{})
+`, &cmdCheck{})
 
 	_, _ = parser.AddCommand("develop", "Develop a Flow catalog", `
 Build and develop a Flow catalog.

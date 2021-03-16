@@ -27,12 +27,12 @@ import (
 	"google.golang.org/grpc"
 )
 
-type cmdTest struct {
+type cmdCheck struct {
 	Source    string `long:"source" required:"true" description:"Catalog source file or URL to build"`
 	Directory string `long:"directory" default:"." description:"Build directory"`
 }
 
-func (cmd cmdTest) Execute(_ []string) (retErr error) {
+func (cmd cmdCheck) Execute(_ []string) (retErr error) {
 	var failed []string
 	// This is temporary (...pause for groans) until we modify the gazette mainboilerplate package
 	// to stop printing stacktraces and panicing on errors. The goal is to be able to simply return
